@@ -2,8 +2,8 @@ import os
 import logging
 import json
 from typing import Optional, Dict, Any, List, Tuple
-import asyncio
 from datetime import datetime
+import asyncio
 
 import discord
 from discord.ext import commands, tasks
@@ -13,7 +13,9 @@ from discord import app_commands
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # 必須
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip().isdigit()]
-DATA_DIR = os.getenv("DATA_DIR", ".")  # Railway Shared Disk を /data でマウント推奨
+DATA_DIR = os.getenv("DATA_DIR", ".")  # Railway Shared Disk を /data にマウント推奨
+# 共通バナー画像（Embed最下部に表示）。環境変数優先・未設定なら固定URLを使用
+BANNER_IMAGE_URL = os.getenv("BANNER_IMAGE_URL", "https://example.com/your-fixed-banner.png")
 
 # ===== コマンド使用をこのロール所持者に限定 =====
 ROLE_LIMIT_ID = 1398724601256874014
@@ -47,19 +49,19 @@ def save_data(data: Dict[str, Any]) -> None:
         log.exception("Failed to save data.json: %s", e)
 
 DB = load_data()
-DB.setdefault("jump_sets", [])  # 追従更新対象
+DB.setdefault("jump_sets", [])  # 自動更新対象レコードの配列
 
 # ===================== Intents / Bot =====================
 intents = discord.Intents.default()
-intents.members = True
 intents.guilds = True
-intents.voice_states = True  # VC人数の更新に必須
-intents.message_content = False
+intents.members = True
+intents.voice_states = True  # VC人数取得に必要
+intents.message_content = False  # テキスト内容は不要
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ===================== 権限チェック =====================
+# ===================== 権限チェック（指定ロール必須） =====================
 def role_required(role_id: int):
     async def predicate(interaction: discord.Interaction) -> bool:
         if not isinstance(interaction.user, discord.Member):
@@ -111,7 +113,7 @@ def build_buttons_for(guild: discord.Guild, channel_ids: List[int]) -> Tuple[str
         buttons.append(discord.ui.Button(label=label, style=discord.ButtonStyle.link, url=url))
         ok_ids.append(cid)
 
-    rows = split_rows(buttons, per_row=5)[:5]  # 最大25ボタン
+    rows = split_rows(buttons, per_row=5)[:5]  # 1メッセージ最大25ボタン
     return ("", rows, ok_ids, ng_ids)
 
 async def edit_jump_message(guild: discord.Guild, channel_id: int, message_id: int, channel_ids: List[int]) -> bool:
@@ -125,7 +127,7 @@ async def edit_jump_message(guild: discord.Guild, channel_id: int, message_id: i
 
     _, rows, _, _ = build_buttons_for(guild, channel_ids)
     try:
-        await msg.edit(view=make_view_from_rows(rows))  # Embedは据え置き、ボタン(view)だけ更新
+        await msg.edit(view=make_view_from_rows(rows))  # Embedは据え置き、ボタンだけ更新
         return True
     except Exception as e:
         log.warning("Failed to edit message %s: %s", message_id, e)
@@ -185,7 +187,6 @@ async def on_ready():
 # ===================== エラーハンドラ =====================
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    import inspect
     from discord.app_commands import CheckFailure
     if isinstance(error, CheckFailure):
         msg = "このコマンドを実行できる権限がありません。"
@@ -200,8 +201,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except:
         pass
 
-# ===================== コマンド（Embed + ボタン／ロール制限） =====================
-@tree.command(name="make_buttons", description="カテゴリ名のパネル＋チャンネルへ飛ぶボタンを生成（VCは人数を表示）")
+# ===================== コマンド（Embed＋ボタン／ロール制限） =====================
+@tree.command(name="make_buttons", description="カテゴリのパネル（金色）＋チャンネルへ飛ぶボタンを生成（VCは人数表示）")
 @app_commands.describe(
     category_id="カテゴリID（数値）",
     description="上に表示する説明文（自由入力）",
@@ -214,7 +215,7 @@ async def make_buttons(interaction: discord.Interaction, category_id: str, descr
     if not guild:
         return await interaction.followup.send("サーバ内で実行してください。", ephemeral=True)
 
-    # 入力
+    # 入力チェック
     try:
         cat_id = int(category_id.strip())
     except:
@@ -241,32 +242,32 @@ async def make_buttons(interaction: discord.Interaction, category_id: str, descr
     if not filtered:
         return await interaction.followup.send("指定カテゴリ内の有効なチャンネルIDがありません。", ephemeral=True)
 
-    # ボタンとビュー
+    # ボタン生成
     _, rows, ok_ids, ng_ids = build_buttons_for(guild, filtered)
     view = make_view_from_rows(rows)
 
-    # ===== 見た目（Embed パネル） =====
-    # タイトル行にカテゴリ名。説明文は本文に。
+    # ===== 見た目（Embed パネル：金色＋最下部に共通バナー） =====
     embed = discord.Embed(
         title=f"カテゴリ：{category.name}",
         description=description or "\u200b",
-        color=discord.Color.blurple()
+        color=discord.Color.gold()  # 左端のカラーバーを金色に
     )
+    # 一番下に共通の飾り画像
+    if BANNER_IMAGE_URL:
+        embed.set_image(url=BANNER_IMAGE_URL)
 
-    # メッセージ送信（公開）
+    # 送信（公開）
     try:
         msg = await interaction.channel.send(embed=embed, view=view)
     except Exception as e:
         log.exception("Failed to send jump buttons: %s", e)
         return await interaction.followup.send("メッセージ送信に失敗しました。Botの送信権限を確認してください。", ephemeral=True)
 
-    # 追従更新に登録
+    # 自動更新に登録
     add_jump_set_record(guild.id, interaction.channel.id, msg.id, ok_ids, cat_id, description)
 
-    note = ""
     skipped_all = sorted(set(skipped + ng_ids))
-    if skipped_all:
-        note = f"\n⚠️ カテゴリ外/無効のIDをスキップ：{', '.join(map(str, skipped_all))}"
+    note = f"\n⚠️ カテゴリ外/無効のIDをスキップ：{', '.join(map(str, skipped_all))}" if skipped_all else ""
     await interaction.followup.send(f"✅ 生成しました。（message_id: {msg.id}）{note}", ephemeral=True)
 
 @tree.command(name="buttons_refresh", description="ジャンプボタンの人数表示を手動更新")
@@ -291,7 +292,7 @@ async def buttons_refresh(interaction: discord.Interaction):
             count += 1
     await interaction.followup.send(f"更新しました：{count} 件", ephemeral=True)
 
-@tree.command(name="buttons_remove", description="追従更新の対象から外します")
+@tree.command(name="buttons_remove", description="自動更新の対象から外します")
 @app_commands.describe(message_id="対象メッセージID（数値）")
 @role_required(ROLE_LIMIT_ID)
 async def buttons_remove(interaction: discord.Interaction, message_id: str):
